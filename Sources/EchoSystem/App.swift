@@ -1,10 +1,12 @@
 import ArgumentParser
 import Distributed
 import NIOCore
+import NIOConcurrencyHelpers
 import NIOFoundationCompat
 import NIOPosix
 import Synchronization
 
+import struct Foundation.URL
 import class Foundation.JSONEncoder
 import class Foundation.JSONDecoder
 
@@ -47,8 +49,11 @@ final class WeakActor {
 }
 
 #if !hasFeature(Mutex)
-// Placeholder until Mutex lands in Swift 6 Toolchain for Xcode
+/// Can be removed as soon as Mutex is in the Xcode Beta Toolchain.
+///
+/// Currently uses `NIOLock` for concurrency safe access to `Value`.
 struct Mutex<Value: ~Copyable>: ~Copyable {
+    private let lock = NIOLock()
     private let value: Box
 
     final class Box {
@@ -68,18 +73,22 @@ extension Mutex: @unchecked Sendable where Value: ~Copyable {
     borrowing func withLock<Result: ~Copyable, E: Error>(
         _ body: (inout sending Value) throws(E) -> sending Result
     ) throws(E) -> sending Result {
+        lock.lock()
+        defer { lock.unlock() }
         return try body(&value.base)
     }
 }
 #endif
 
-final class Client: Sendable {
+struct Client: Sendable {
+    let path: String
+
     func withChannel<Result>(
         id: Int,
         _ body: (NIOAsyncChannelInboundStream<ByteBuffer>, NIOAsyncChannelOutboundWriter<ByteBuffer>) async throws -> Result
     ) async throws -> Result {
         let client = try await ClientBootstrap(group: .singletonMultiThreadedEventLoopGroup)
-            .connect(unixDomainSocketPath: "/Users/timozacherl/Downloads/sock\(id)") { channel in
+            .connect(unixDomainSocketPath: "\(path)\(id)") { channel in
                 channel.eventLoop.makeCompletedFuture {
                     return try NIOAsyncChannel<ByteBuffer, ByteBuffer>(
                         wrappingChannelSynchronously: channel
@@ -112,8 +121,9 @@ final class System: DistributedActorSystem {
     }
 
     init(id: Int) async throws {
+        let socketPath = URL.downloadsDirectory.appending(path: "sock").path()
         let server = try await ServerBootstrap(group: .singletonMultiThreadedEventLoopGroup)
-            .bind(unixDomainSocketPath: "/Users/timozacherl/Downloads/sock\(id)", cleanupExistingSocketFile: true) { channel in
+            .bind(unixDomainSocketPath: "\(socketPath)\(id)", cleanupExistingSocketFile: true) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
                 }
@@ -121,27 +131,23 @@ final class System: DistributedActorSystem {
 
         self.systemID = id
         self.server = server
-        self.client = .init()
+        self.client = .init(path: socketPath)
     }
 
     func run() async throws {
-        try await withTaskCancellationHandler {
-            try await withThrowingDiscardingTaskGroup { group in
-                try await server.executeThenClose { inbound, outbound in
-                    for try await connection in inbound {
-                        group.addTask {
-                            try await connection.executeThenClose { inbound, outbound in
-                                for try await packet in inbound {
-                                    try await outbound.write(packet)
-                                }
-                                outbound.finish()
+        try await withThrowingDiscardingTaskGroup { group in
+            try await server.executeThenClose { inbound, outbound in
+                for try await connection in inbound {
+                    group.addTask {
+                        try await connection.executeThenClose { inbound, outbound in
+                            for try await packet in inbound {
+                                try await outbound.write(packet)
                             }
+                            outbound.finish()
                         }
                     }
                 }
             }
-        } onCancel: {
-            return
         }
     }
 
@@ -173,14 +179,17 @@ final class System: DistributedActorSystem {
         throwing: Err.Type,
         returning: Result.Type
     ) async throws -> Result where Actor.ID == ActorID {
+        // this is a very idiomatic way to do this
         var buffer = try await client.withChannel(id: actor.id.systemID) { inbound, outbound in
             try await outbound.write(invocation.buffer)
             for try await value in inbound {
                 return value
             }
-            throw ChannelError.eof
+            throw ChannelError.eof // just throwing some random error for now, eof seems okish
         }
-        return try buffer.readJSONDecodable(returning, length: buffer.readableBytes)!
+
+        // the following cannot be nil as we're reading readable bytes, so there must be enough data readable
+        return try buffer.readJSONDecodable(returning, length: buffer.readableBytes).unsafelyUnwrapped
     }
 
     func remoteCallVoid<Act, Err>(
@@ -205,7 +214,8 @@ struct SystemEncoder: DistributedTargetInvocationEncoder {
     }
 
     mutating func recordReturnType<Res: SerializationRequirement>(_ resultType: Res.Type) throws {
-        // unused
+        // The caller functions return type can be encoded as part of the serialized packet, not yet sure in
+        // which case this might be necessary. Maybe for method overloads?
     }
 
     mutating func recordGenericSubstitution<T>(_ type: T.Type) throws {
@@ -225,7 +235,8 @@ struct SystemEncoder: DistributedTargetInvocationEncoder {
     }
     
     mutating func doneRecording() throws {
-        // unused
+        // Seems to be called when encoding of a call is done. Might be applicable to bundle up the final packet here.
+        // E.g. computing and prepending fields for checksum and packet length in the future.
     }
 }
 
