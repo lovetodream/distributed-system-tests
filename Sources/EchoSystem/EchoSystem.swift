@@ -1,4 +1,3 @@
-import ArgumentParser
 import Distributed
 import NIOCore
 import NIOConcurrencyHelpers
@@ -9,28 +8,6 @@ import Synchronization
 import struct Foundation.URL
 import class Foundation.JSONEncoder
 import class Foundation.JSONDecoder
-
-@main
-struct App: AsyncParsableCommand {
-    mutating func run() async throws {
-        let system1 = try await System(id: 1)
-        let system2 = try await System(id: 2)
-        try await withThrowingDiscardingTaskGroup { group in
-            group.addTask {
-                try await system1.run()
-            }
-
-            group.addTask {
-                try await system2.run()
-            }
-
-            let echo = try Echo.resolve(id: .init(id: 1, systemID: 2), using: system1)
-            print(try await echo.echo("Hello World!"))
-
-            group.cancelAll()
-        }
-    }
-}
 
 typealias DefaultDistributedActorSystem = System
 
@@ -47,38 +24,6 @@ final class WeakActor {
         self.base = base
     }
 }
-
-#if !hasFeature(Mutex)
-/// Can be removed as soon as Mutex is in the Xcode Beta Toolchain.
-///
-/// Currently uses `NIOLock` for concurrency safe access to `Value`.
-struct Mutex<Value: ~Copyable>: ~Copyable {
-    private let lock = NIOLock()
-    private let value: Box
-
-    final class Box {
-        var base: Value
-
-        init(_ base: consuming Value) {
-            self.base = base
-        }
-    }
-
-    init(_ initialValue: consuming sending Value) {
-        value = .init(initialValue)
-    }
-}
-
-extension Mutex: @unchecked Sendable where Value: ~Copyable {
-    borrowing func withLock<Result: ~Copyable, E: Error>(
-        _ body: (inout sending Value) throws(E) -> sending Result
-    ) throws(E) -> sending Result {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body(&value.base)
-    }
-}
-#endif
 
 struct Client: Sendable {
     let path: String
