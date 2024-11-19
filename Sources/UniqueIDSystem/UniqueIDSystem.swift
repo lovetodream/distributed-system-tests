@@ -208,8 +208,12 @@ final class System: DistributedActorSystem {
 
     init(id: UInt32) async throws {
         let server = try await ServerBootstrap(group: .singletonMultiThreadedEventLoopGroup)
+            .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .serverChannelOption(.tcpOption(.tcp_nodelay), value: 1)
+            .childChannelOption(.tcpOption(.tcp_nodelay), value: 1)
+            .childChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelOption(.maxMessagesPerRead, value: 16)
+            .childChannelOption(.recvAllocator, value: AdaptiveRecvByteBufferAllocator())
             .bind(host: "127.0.0.1", port: 8080 + Int(id)) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(EnvelopeEncoder()), name: "server-enc")
@@ -298,20 +302,25 @@ final class System: DistributedActorSystem {
 extension System {
 
     func run() async throws {
-        try await withThrowingDiscardingTaskGroup { group in
-            group.addTask {
-                try await self.outgoingTraffic()
-            }
+        try await withTaskCancellationHandler {
+            try await withThrowingDiscardingTaskGroup { group in
+                group.addTask {
+                    await self.outgoingTraffic()
+                }
 
-            group.addTask {
-                for try await envelope in self.resultsStream {
-                    try await self.handleEnvelope(envelope, replyOn: nil)
+                group.addTask {
+                    for try await envelope in self.resultsStream {
+                        try await self.handleEnvelope(envelope, replyOn: nil)
+                    }
+                }
+
+                group.addTask {
+                    try await self.serverTraffic()
                 }
             }
-
-            group.addTask {
-                try await self.serverTraffic()
-            }
+        } onCancel: { // FIXME: improve cleanup
+            inflightCalls.withLock { $0.forEach { $0.value.resume(throwing: CancellationError()) } }
+            openConnections.withLock { $0.forEach { $0.value.close(promise: nil) } }
         }
     }
 
@@ -325,7 +334,6 @@ extension System {
 
         let channel = try await ClientBootstrap(group: .singletonMultiThreadedEventLoopGroup)
             .channelOption(.socketOption(.so_reuseaddr), value: 1)
-            .channelOption(.tcpOption(.so_keepalive), value: 1)
             .connect(host: "127.0.0.1", port: 8080 + Int(target)) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(MessageToByteHandler(EnvelopeEncoder()), name: "client-enc")
@@ -338,8 +346,8 @@ extension System {
         return channel
     }
 
-    private func outgoingTraffic() async throws {
-        try await withThrowingDiscardingTaskGroup { group in
+    private func outgoingTraffic() async {
+        await withDiscardingTaskGroup { group in
             for await message in self.invocationStream {
                 group.addTask {
                     do {
@@ -353,8 +361,20 @@ extension System {
                             metadata: ["error": "\(error)"]
                         )
                     }
-                    let channel = try await self.channel(for: message.0.receivingSystem)
-                    try await channel.writeAndFlush(message.0)
+                    while true { // FIXME: improve!
+                        do {
+                            let channel = try await self.channel(for: message.0.receivingSystem)
+                            try await channel.writeAndFlush(message.0)
+                            break
+                        } catch {
+                            self.logger.warning("Failed to create channel for message.", metadata: ["error": "\(error)", "timeout": "100ms"])
+                            do {
+                                try await Task.sleep(for: .milliseconds(100))
+                            } catch {
+                                break
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -372,6 +392,8 @@ extension System {
                                 }
                             }
                             self.logger.trace("Closed connection to client.")
+                        } catch is CancellationError {
+                            self.logger.trace("Connection to client cancelled.")
                         } catch {
                             self.logger.warning("Failure in connection to client.", metadata: ["error": "\(error)"])
                         }
